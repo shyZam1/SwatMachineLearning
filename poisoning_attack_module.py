@@ -2,10 +2,14 @@ from locale import normalize
 from turtle import forward
 import numpy as np
 import copy
+import conf
 import math
 from pyparsing import alphas
+from swat_dataset import PoisonedDataset
+from torch.utils.data import DataLoader
 from sklearn.utils import shuffle
 import torch
+from torch.autograd import Variable
 from torch import nn, optim
 from torch.utils.data import DataLoader
 from network import Network
@@ -68,8 +72,9 @@ def ObtainGradientOfWeightInModelNew(ModelEnc, ModelDec, TrainingData, batch_siz
         #mse_loss = nn.MSELoss()
         #loss = mse_loss(guess, answer)
         (loss, given, predict) = GetLossFunc(batch, enc, dec, autograd=False)
-        loss.backward()
-        epoch_loss += loss.item()
+        loss.backward(retain_graph=True)
+        #epoch_loss += loss.item()
+        epoch_loss += loss
     
     for w in enc.parameters():
         if torch.max(torch.abs(w.grad))>MaxGrad:
@@ -116,7 +121,7 @@ def TrainTargetModelNew(ModelEnc, ModelDec, TrainingData, epochs, batch_size, Al
         (epoch_loss,enc,dec) = ObtainGradientOfWeightInModelNew(enc,dec, TrainingData, batch_size)
         UpdateModel(enc,-Alpha)
         UpdateModel(dec,-Alpha)
-        print("epoch loss ="+ str(epoch_loss))
+        print("Train Target Model New epoch loss ="+ str(epoch_loss))
     return (epoch_loss,enc,dec)
 
 #---------------------------------------------------------------------------------------------------------
@@ -244,10 +249,10 @@ def ObtainGradientofDataNew(Encoder, Decoder, TrainingData, epochs,batch_size ,A
             predicttemp[i] = (predict1[i]-predict2[i])/Epsilon
            # givenbasket.append((given1[i]-given2[i])/Epsilon) #same as ddxp in sensei's code
            # predictbasket.append((predict1[i]-predict2[i])/Epsilon) #same as ddxp in sensei's code
-        print('-------------len of givenzeros---------------')
-        print(len(givenzeros))
-        print('--------------len of givenbasket---------------')
-        print(len(giventemp))
+        #print('-------------len of givenzeros---------------')
+        #print(len(givenzeros))
+        #print('--------------len of givenbasket---------------')
+        #print(len(giventemp))
         for i in range(len(giventemp)):
             givengrad[i] = givenzeros[i]-(Alpha*giventemp[i])
             predictgrad[i] = predictzeros[i]-(Alpha*predicttemp[i])
@@ -261,14 +266,14 @@ def ObtainGradientofDataNew(Encoder, Decoder, TrainingData, epochs,batch_size ,A
         for j in range(len(dec1)):
             w2_tmp=(dec1[j].grad - dec2[j].grad)/Epsilon
             w2[j].grad = w2[j].grad - Alpha*w2_tmp
-        print('---------------reach here---------------')
+        #print('---------------reach here---------------')
     for i in range(len(givengrad)):
         if torch.max(torch.abs(givengrad[i]))>max_grad:
             givengrad[i] = givengrad[i]/torch.max(torch.abs(givengrad[i]))*max_grad
             
         if torch.max(torch.abs(predictgrad[i]))>max_grad:
             predictgrad[i] = predictgrad[i]/torch.max(torch.abs(predictgrad[i]))*max_grad
-    print('----------reach last line --------------')
+    #print('----------reach last line --------------')
     print(len(givengrad))
     print(givengrad[0])
     print(predictgrad[0])
@@ -292,13 +297,28 @@ class ErrorFunctionWithPredefinedLossAndGrad(torch.autograd.Function):
 
 
 def error_with_predefined_loss_and_grad(data,loss,grad):
-	return ErrorFunctionWithPredefinedLossAndGrad().apply((data,loss,grad))[0]
+	return ErrorFunctionWithPredefinedLossAndGrad().apply((data,loss,grad))
+    #return ErrorFunctionWithPredefinedLossAndGrad().apply((data,loss,grad))[0]
 
 #------------------------------------------------------------------------------------------------------------------
-#class ErrorFunctionWithPredefinedLossAndGradNew(torch.autograd.Function):
-#    @staticmethod
-#    def forward(ctx,):
+class ErrorFunctionWithPredefinedLossAndGradNew(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx,inputs):
+        ctx.save_for_backward((0,1,2,3,4))
+        #ctx.save_for_backward(given,predict,epochloss,givengrad,predictgrad)
+        loss = inputs[2]
+        return loss
 
+    @staticmethod
+    def backward(ctx,grad_output):
+        given,predict,epochloss,givengrad,predictgrad = ctx.saved_tensors
+
+        return givengrad, predictgrad, None, None, None
+
+def error_with_predefined_loss_and_grad_new(given,predict,epochloss,givengrad,predictgrad):
+    return ErrorFunctionWithPredefinedLossAndGradNew().apply((given,predict,epochloss,givengrad,predictgrad))
+
+    
 
 #------------------------------------------------------------------------------------------------------------------
 
@@ -307,7 +327,68 @@ def SearchList(li,key):
         if li[i]==key:
             return i
     return -1
+#-------------------------------------------------------------------------------------------------------------------
+class DirectPoisoningAttackerNew():
+    def __init__(self, TargetModelEnc, TargetModelDec, list_of_attack_points):
+        self.TargetModelEnc=TargetModelEnc
+        self.TargetModelDec=TargetModelDec
+        self.li=list_of_attack_points
+    
+    def MaskForAttackPoints(self, size):
+        a=np.zeros(size[1])
+        for i in self.li:
+            a[i]=1
+        return np.tile(a,(size[0],1)).astype(np.float32)
+    
+    def ClippedRelu(self,x,z):
+        value = torch.min(torch.max(torch.tensor(0),x),torch.tensor(z))
+    
+        return value 
 
+    def sliding_window(self,x3):
+    
+        x4 = []
+        for i in range(x3.shape[0]-100):
+            #x4 = [x3[i:conf.WINDOW_SIZE + i]]
+            x4.append(x3[i:conf.WINDOW_SIZE + i])
+    
+        split_window = [
+                        (w[:conf.WINDOW_GIVEN],
+                        w[conf.WINDOW_GIVEN:conf.WINDOW_GIVEN + conf.WINDOW_PREDICT],
+                        w[-1]) for w in x4
+                    ]
+        
+        return split_window
+
+    def GenerateNew(self,x2, epochs, batch_size, steps=50):
+        #BATCH_SIZE = 4096
+        l = nn.Linear(1,x2.size)
+        x2 = torch.tensor(x2)
+        opt=optim.Adam(l.parameters())
+        mask1=self.MaskForAttackPoints(x2.shape)
+        mask = torch.tensor(mask1)
+        for i in range(steps):
+            #x3=self.ClippedRelu(x2+mask*self.ClippedRelu(l(torch.tensor(np.zeros((1,1)).astype(np.float32))),z=1.0).reshape(x2.shape)-1.0*0.5*torch.tensor(np.ones(x2.shape).astype(np.float32))*mask,z=1.0)
+            x3=self.ClippedRelu(x2+mask*self.ClippedRelu(l(torch.tensor(np.zeros((1,1)).astype(np.float32))),z=1.0).reshape(x2.shape)-1.0*0.5*torch.tensor(np.ones(x2.shape).astype(np.float32))*mask,z=1.0).float()
+            splitdata = self.sliding_window(x3)
+            TrainingData = PoisonedDataset(training_data=splitdata)
+            (gradgiven, gradpredict,loss) = ObtainGradientofDataNew(self.TargetModelEnc, self.TargetModelDec, TrainingData, epochs, batch_size)
+            for batch in DataLoader(TrainingData,batch_size=batch_size, shuffle=True):
+                given1 = batch['given'].to(torch.device('cuda:0'))
+                predict1 = batch['predict'].to(torch.device('cuda:0'))
+                loss1 = error_with_predefined_loss_and_grad_new(given1,predict1,loss,gradgiven,gradpredict)
+                #loss1 = poisoning_attack_module.error_with_predefined_loss_and_grad(given1, epoch_loss, gradgiven[i])
+                loss1 = Variable(loss1, requires_grad = True)
+                #l.cleargrads()
+                l.zero_grad()
+                loss1.backward()
+                #opt.update()
+                opt.step()
+                print(loss1.data)
+        
+        return x3
+
+#-------------------------------------------------------------------------------------------------------------------
 class DirectPoisoningAttacker():
 	def __init__(self, TargetModel,list_of_attack_points):
 		self.TargetModel=TargetModel
@@ -352,6 +433,8 @@ class DirectPoisoningAttacker():
 		if (normalizeRequired):
 			x3=self.TargetModel.denormalize(x3)
 		return x3
+    #-----------------------------------------------------------------------------------------------------------
+    
 
 def ListOfTargetPoint(TargetModel, target):
 	out=list(np.argsort(-np.mean(np.abs(TargetModel.test_each(target)),axis=0)))

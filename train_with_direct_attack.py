@@ -1,61 +1,39 @@
 import numpy as np
+import pandas as pd
 import torch
 from torch import nn, optim
 from PIL import Image
-import sys
 import pickle
+from network import Network
+import conf
+import model
 import poisoning_attack_module
-
-def attack_feature(sensorID,num):
-	l=list()
-	for i in range(0,51*num,51):
-		if sensorID==0:
-			for j in range(0,5):
-				l.append(i+j)
-		if sensorID==1:
-			for j in range(5,16):
-				l.append(i+j)
-		if sensorID==2:
-			for j in range(16,25):
-				l.append(i+j)
-		if sensorID==3:
-			for j in range(25,34):
-				l.append(i+j)
-		if sensorID==4:
-			for j in range(34,47):
-				l.append(i+j)
-		if sensorID==5:
-			for j in range(47,51):
-				l.append(i+j)
-	return l
+from swat_dataset import SWaTDataset
+from datetime import datetime
 
 
 def main():
 	step=5000
-	param = sys.argv
-
-	training_data=np.loadtxt(param[1], delimiter=',').astype(np.float32)
 	
-	with open(param[2], 'rb') as i:
-		cl = pickle.load(i)
-		
-	li_attack=attack_feature(int(param[3]),4)
-	perm = np.random.permutation(training_data.shape[0])
+
+#	training_data=np.loadtxt(param[1], delimiter=',').astype(np.float32)
+	p_features = len(conf.P_SRCS[5 - 1])
+	encoder = model.Encoder(n_inputs=p_features,n_hiddens=conf.N_HIDDEN_CELLS).to(torch.device('cuda:0'))
+	decoder = model.AttentionDecoder(n_hiddens=conf.N_HIDDEN_CELLS, n_features=p_features).to(torch.device('cuda:0'))
+	Features = pd.read_csv('dat/Swat_Normal2.csv', usecols=['AIT501','AIT502','AIT503','AIT504','FIT501','FIT502','FIT503','FIT504','P501','P502','PIT501','PIT502','PIT503']).values	
+	li_attack = [4, 5, 6, 7]
+#	perm = np.random.permutation(training_data.shape[0])
 	
 
 	for i in range(0,10):
+		start = datetime.now()
 #	for i in range(0,training_data.shape[0],step):
-		Attacker=poisoning_attack_module.DirectPoisoningAttacker(cl,li_attack)
-		if "robust" in param:
-			Attacker=poisoning_attack_module.DirectPoisoningAttacker(cl.model,li_attack)
-#		data=Attacker.Generate(training_data[perm[i:i+step]],training_data[0:step],None,None,InverseLossFunction=True)
-		data=Attacker.Generate(training_data,training_data,None,None,InverseLossFunction=True)
-		for j in range(10):
-			cl.update(data)
-		with open(param[2]+"-Target-"+param[3]+"-"+str(i)+".pkl", 'wb') as o:
-			pickle.dump(cl, o)
-
-
-	
+		Attacker=poisoning_attack_module.DirectPoisoningAttackerNew(encoder, decoder, li_attack)
+		data = Attacker.GenerateNew(Features,epochs=1,batch_size=40)
+		print('----------------------data after attack--------------------')
+		print(data)
+	with open ('dat/poisoneddata.dat', 'wb') as fh:
+		pickle.dump(data,fh)
+	print(f'* the total training time: {datetime.now() - start}')
 if __name__ == '__main__':
     main()

@@ -23,3 +23,18 @@ class SWaTDataset(Dataset):
             'attack': torch.tensor(1 if self.picks[idx][4] else 0,
                                    dtype=torch.uint8)
         }
+
+
+class PoisonedDataset(Dataset):
+    def __init__(self, training_data):
+        self.data = training_data
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        return {
+            'given': self.data[idx][0],
+            'predict': self.data[idx][1],
+            'answer': self.data[idx][2]
+        }

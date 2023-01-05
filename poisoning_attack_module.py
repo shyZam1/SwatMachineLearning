@@ -14,67 +14,44 @@ from torch import nn, optim
 from torch.utils.data import DataLoader
 from network import Network
 
-def GetLossFunc(batch, enc, dec, autograd=True):
-    if autograd:
-        given = batch['given'].to(torch.device('cuda:0'))
-        predict = batch['predict'].to(torch.device('cuda:0'))
-        answer = batch['answer'].to(torch.device('cuda:0')) 
-        given1 = given.clone().detach().requires_grad_(True)
-        predict1 = predict.clone().detach().requires_grad_(True)
-        encoder_outs, context = enc(given1)
-        guess = dec(encoder_outs, context, predict1)
-        mse_loss = nn.MSELoss()
-        loss = mse_loss(guess, answer)
+def GetLoss(given, predict, answer, enc, dec, InverseLossFunction=False):
+    encoder_outs, context = enc(given)
+    guess = dec(encoder_outs, context, predict)
+    mse_loss = nn.MSELoss()
+    if InverseLossFunction:
+        loss = 1/mse_loss(guess, answer)    
     else:
-        given1 = batch['given'].to(torch.device('cuda:0'))
-        predict1 = batch['predict'].to(torch.device('cuda:0'))
-        answer = batch['answer'].to(torch.device('cuda:0')) 
-        encoder_outs, context = enc(given1)
-        guess = dec(encoder_outs, context, predict1)
-        mse_loss = nn.MSELoss()
         loss = mse_loss(guess, answer)
-        
-    return (loss,given1, predict1 )
+    return loss
 
-def ObtainGradientOfWeightInModel(Model,Data,Label,ListOfUnusedFeatures=None,InverseLossFunction=False,Max=1.0,epsilon=1e-4,MaxGrad=100.0):
-    m=copy.deepcopy(Model)
-    m.zero_grad()
-    #loss_func = m.get_loss_func()
-    if not InverseLossFunction:
-        #loss = loss_func(F.clipped_relu(Data,z=Max), Label,normalize=False)
-        loss = m.get_loss_func(torch.clamp(Data, z=Max), Label)
+def WeightedSumLoss(given, predict, answer, enc, dec, weight, InverseLossFunction=False):
+    encoder_outs, context = enc(given)
+    guess = dec(encoder_outs, context, predict)
+    mse_loss = nn.MSELoss()
+    if InverseLossFunction:
+        loss1 = weight * (1/mse_loss(guess, answer))
+        loss2 = (1-weight) * mse_loss(guess, answer)
+        loss = loss1 + loss2
     else:
-        loss_tmp = m.get_loss_func(torch.clamp(Data, z=Max), Label)
-        loss = 1/(loss_tmp+epsilon)
+        loss = mse_loss(guess, answer)
+    return loss
 
-    loss.backward()
-    for w in m.parameters():
-        if np.max(np.abs(w.grad))>MaxGrad:
-            w.grad=w.grad/np.max(np.abs(w.grad))*MaxGrad
-    return (loss.data,m)
-#--------------------------------------------------------------------------------------------------------------
-
-def ObtainGradientOfWeightInModelNew(ModelEnc, ModelDec, TrainingData, batch_size, MaxGrad=100.0):
+def ObtainGradientOfWeightInModel(given, predict, answer, ModelEnc, ModelDec, batch_size=-1, MaxGrad=100.0, InverseLossFunction=False):
     enc = copy.deepcopy(ModelEnc)
     dec = copy.deepcopy(ModelDec)
     enc.zero_grad()
     dec.zero_grad()
-    epoch_loss = 0
 
-    for batch in DataLoader(TrainingData, batch_size=batch_size, shuffle=True):
-        #answer, guess = Network.infer(batch)
-        #loss = Network.get_loss_func(guess, answer)
-        #given = batch['given'].to(torch.device('cuda:0'))
-        #predict = batch['predict'].to(torch.device('cuda:0'))
-        #answer = batch['answer'].to(torch.device('cuda:0')) 
-        #encoder_outs, context = enc(given)
-        #guess = dec(encoder_outs, context, predict)
-        #mse_loss = nn.MSELoss()
-        #loss = mse_loss(guess, answer)
-        (loss, given, predict) = GetLossFunc(batch, enc, dec, autograd=False)
-        loss.backward(retain_graph=True)
-        #epoch_loss += loss.item()
-        epoch_loss += loss
+    perm = np.random.permutation(given.shape[0])
+    if batch_size<0:
+        batch_size=given.shape[0]
+    loss=0
+    for i in range(0, given.shape[0], batch_size):
+        loss = loss+ GetLoss(given[perm[i:i + batch_size]], predict[perm[i:i + batch_size]], answer[perm[i:i + batch_size]], enc, dec, InverseLossFunction=InverseLossFunction)
+        if (InverseLossFunction):
+            print(loss)
+    loss.backward(retain_graph=True)
+    
     
     for w in enc.parameters():
         if torch.max(torch.abs(w.grad))>MaxGrad:
@@ -84,17 +61,17 @@ def ObtainGradientOfWeightInModelNew(ModelEnc, ModelDec, TrainingData, batch_siz
         if torch.max(torch.abs(w.grad))>MaxGrad:
             w.grad = w.grad/torch.max(torch.abs(w.grad))*MaxGrad
     
-    return (epoch_loss, enc, dec)
-#--------------------------------------------------------------------------------------------------------------
-    
+    return (loss, enc, dec)
+
 def ObtainListOfParameters(Model):
     l=list()
     for w in Model.parameters():
-        l.append(w)
-        #l.append(copy.deepcopy(w))#using deepcopy I get an error whereby the grad output is none
+        w_tmp=copy.deepcopy(w)
+        w_tmp.grad=copy.deepcopy(w.grad)
+        l.append(w_tmp)
     return l
 
-def UpdateModel(Model, Alpha,MaxGrad=1,ListOfParam=None):
+def UpdateModel(Model, Alpha,ListOfParam=None):
 	if ListOfParam is None:
 		for w in Model.parameters():
 			w.data=w.data + Alpha* w.grad
@@ -104,117 +81,43 @@ def UpdateModel(Model, Alpha,MaxGrad=1,ListOfParam=None):
 			w.data=w.data +Alpha * ListOfParam[i].grad
 			i=i+1
 
-def TrainTargetModel(Model, TrainingData, TrainingLabel,NumIteration=200,Alpha=0.1,DataMax=1.0):
-	m=copy.deepcopy(Model)
-	for t in range(NumIteration):
-		(loss,m)=ObtainGradientOfWeightInModel(m,TrainingData,TrainingLabel,Max=DataMax)
-		UpdateModel(m,-Alpha)
-	return (loss,m)
-
-#-------------------------------------------------------------------------------------------------------
-
-def TrainTargetModelNew(ModelEnc, ModelDec, TrainingData, epochs, batch_size, Alpha=0.1):
+def TrainTargetModel(given, predict, answer, ModelEnc, ModelDec, epochs,  Alpha=0.1):
     enc = copy.deepcopy(ModelEnc)
     dec = copy.deepcopy(ModelDec)
-
     for e in range(epochs):
-        (epoch_loss,enc,dec) = ObtainGradientOfWeightInModelNew(enc,dec, TrainingData, batch_size)
+        (epoch_loss,enc,dec) = ObtainGradientOfWeightInModel(given, predict, answer, enc,dec)
+        epoch_loss.backward(retain_graph=True)
         UpdateModel(enc,-Alpha)
         UpdateModel(dec,-Alpha)
-        print("Train Target Model New epoch loss ="+ str(epoch_loss))
+        #print("Train Target Model New epoch loss ="+ str(epoch_loss))
     return (epoch_loss,enc,dec)
 
-#---------------------------------------------------------------------------------------------------------
 
-# this is the function that is trying to maximize the loss function to generate the attack , we are not using any optimization function to calculate the loss 
-def ObtainGradientOfData(TrainedModel,Xp,Xval,Yp,Yval,NumIteration=3,Alpha=0.01,Epsilon=1e-6,max_grad=100,Mask=None,ListOfUnusedFeatures=None,InverseLossFunction=True):
-    dxp=np.zeros(Xp.shape).astype(np.float32)
-    (loss,m)=TrainTargetModel(TrainedModel, Xp,Yp,NumIteration=NumIteration,Alpha=Alpha)
-    (loss,m)=ObtainGradientOfWeightInModel(m,Xval,Yval,ListOfUnusedFeatures=ListOfUnusedFeatures,InverseLossFunction=InverseLossFunction)
-    w=ObtainListOfParameters(m)
-    for i in range(NumIteration-1):
-        (loss_tmp,m)=ObtainGradientOfWeightInModel(m,Xp,Yp)
-        UpdateModel(m,Alpha)
-        M1=copy.deepcopy(m)
-        M1.zero_grad()
-        UpdateModel(M1,(0.5)*Epsilon,ListOfParam=w)
-        X1=copy.deepcopy(Xp) #stuck here 
-        torch.autograd.grad([M1.get_loss_func(torch.clamp(X1,z=1.0),Yp)], [X1])
-        M1.zero_grad()
-        loss_tmp = M1.get_loss_func(torch.clamp(X1,z=1.0),Yp)
-        loss_tmp.backward()
-        m1=ObtainListOfParameters(M1)
-        M2=copy.deepcopy(m)
-        M2.zero_grad()
-        UpdateModel(M2,(-0.5)*Epsilon,ListOfParam=w)
-        X2=copy.deepcopy(Xp)
-        torch.autograd.grad([M2.get_loss_func(torch.clamp(X2,z=1.0),Yp)], [X2])
-        M2.zero_grad()
-        loss_tmp = M2.get_loss_func(torch.clamp(X2,z=1.0),Yp)
-        loss_tmp.backward()
-        m2=ObtainListOfParameters(M2)
-        
-        ddxp=(X1.grad-X2.grad)/Epsilon
-        if Mask is not None:
-            ddxp=ddxp*Mask
-        dxp = dxp - Alpha*ddxp
-        for j in range(len(m1)):
-            w_tmp=(m1[j].grad-m2[j].grad)/Epsilon
-            w[j].grad=w[j].grad-Alpha*w_tmp
-    if np.max(np.abs(dxp))>max_grad:
-        dxp=dxp/np.max(np.abs(dxp))*max_grad
-    return dxp,loss
+def GetGradient(given, predict, answer, enc, dec):
+    given1 = Variable(given,requires_grad=True).to(torch.device('cuda:0'))
+    predict1 = Variable(predict,requires_grad=True).to(torch.device('cuda:0'))
+    answer1 = Variable(answer,requires_grad=True).to(torch.device('cuda:0'))
 
-#------------------------------------------------------------------------------------------------------------------
-def CreateZeroTensor(TrainingData, batch_size):
-    givenzeros = []
-    predictzeros = []
-    for batch in DataLoader(TrainingData, batch_size=batch_size, shuffle=True):
-        given = batch['given'].to(torch.device('cuda:0'))
-        predict = batch['predict'].to(torch.device('cuda:0'))
-        dgiven = torch.zeros(given.shape).to(torch.device('cuda:0'))
-        dpredict = torch.zeros(predict.shape).to(torch.device('cuda:0'))
-        givenzeros.append(dgiven)
-        predictzeros.append(dpredict)
+    loss = GetLoss(given1, predict1, answer1, enc, dec)
+    loss.backward(retain_graph=True)
+      
+    return (given1.grad, copy.deepcopy(predict1.grad), copy.deepcopy(answer1.grad))
+
+
+def ObtainGradientofData(given, predict, answer, givenValidation, predictValidation, answerValidation, Encoder, Decoder, epochs , Alpha=0.1, Epsilon=1e-3, max_grad=100, batch_size=400, Scale=1e2, Mask=None, ListofUnusedFeatures=None, InverseLossFunction=True):
+    giventemp = torch.zeros(given.shape).to(torch.device('cuda:0'))
+    predicttemp = torch.zeros(predict.shape).to(torch.device('cuda:0'))
+    answertemp = torch.zeros(answer.shape).to(torch.device('cuda:0'))
+    givengrad = torch.zeros(given.shape).to(torch.device('cuda:0'))
+    predictgrad = torch.zeros(predict.shape).to(torch.device('cuda:0'))
+    answergrad = torch.zeros(answer.shape).to(torch.device('cuda:0'))
     
-    return (givenzeros, predictzeros)
-
-
-def CalculateLoss(enc, dec, TrainingData, batch_size):
-    for batch in DataLoader(TrainingData, batch_size=batch_size, shuffle=True):
-        (loss_temp, given, predict) = GetLossFunc(batch, enc, dec, autograd=False)
-        loss_temp.backward()
-    
-    return loss_temp
-
-def GetGradientUsingAutoGrad(enc, dec, TrainingData,batch_size):
-    givenbag = []
-    predictbag = []
-    for batch in DataLoader(TrainingData, batch_size=batch_size, shuffle=True):
-        (loss, given1, predict1) = GetLossFunc(batch, enc, dec, autograd=True)
-        grad = torch.autograd.grad(outputs=loss, inputs=(given1,predict1), retain_graph=True, allow_unused=True)
-        loss.backward()
-        givenbag.append(given1.grad)
-        predictbag.append(predict1.grad)
-    return (grad,enc, dec, givenbag, predictbag)
-#------------------------------------------------------------------------------------------------------------------
-def ObtainGradientofDataNew(Encoder, Decoder, TrainingData, epochs,batch_size ,Alpha=0.01, Epsilon=1e-6, max_grad=100, Mask=None, ListofUnusedFeatures=None, InverseLossFunction=True):
-    givenbasket = []
-    predictbasket = []
-    gradgiven = []
-    gradpredict = []
-    (givenzeros, predictzeros) = CreateZeroTensor(TrainingData=TrainingData, batch_size=batch_size)
-    giventemp = givenzeros
-    predicttemp = predictzeros
-    givengrad = givenzeros
-    predictgrad = predictzeros
-    
-    (epoch_loss,enc,dec)=TrainTargetModelNew(Encoder, Decoder, TrainingData=TrainingData, epochs=epochs, batch_size=batch_size, Alpha=Alpha)
-    (epoch_loss,enc,dec)=ObtainGradientOfWeightInModelNew(enc,dec,TrainingData, batch_size=batch_size)
+    (epoch_loss,enc,dec)=TrainTargetModel(given, predict, answer, Encoder, Decoder, epochs=epochs+1, Alpha=Alpha)
+    (loss,enc,dec)=ObtainGradientOfWeightInModel(givenValidation, predictValidation, answerValidation, enc,dec,batch_size=batch_size, InverseLossFunction=True)
     w1=ObtainListOfParameters(enc)
     w2=ObtainListOfParameters(dec)
-    for i in range(epochs-1):
-        (epoch_loss_temp,enc,dec,)=ObtainGradientOfWeightInModelNew(enc,dec,TrainingData, batch_size=batch_size)
+    for i in range(epochs):
+        (epoch_loss_temp,enc,dec)=ObtainGradientOfWeightInModel(given, predict, answer, enc,dec)
         UpdateModel(enc,Alpha)
         UpdateModel(dec,Alpha)
         ENC1=copy.deepcopy(enc)
@@ -223,12 +126,11 @@ def ObtainGradientofDataNew(Encoder, Decoder, TrainingData, epochs,batch_size ,A
         DEC1.zero_grad()
         UpdateModel(ENC1,(0.5)*Epsilon,ListOfParam=w1)
         UpdateModel(DEC1,(0.5)*Epsilon,ListOfParam=w2)
-        (grad,ENC1,DEC1, given1, predict1)=GetGradientUsingAutoGrad(ENC1, DEC1, TrainingData=TrainingData, batch_size=batch_size)
-        #print(grad)
+        (given1, predict1, answer1)=GetGradient(given, predict, answer, ENC1, DEC1)
         ENC1.zero_grad()
         DEC1.zero_grad()
-        epoch_loss_temp = CalculateLoss(ENC1, DEC1, TrainingData, batch_size=batch_size)
-        #epoch_loss_temp.backward()
+        epoch_loss_temp = GetLoss(given, predict, answer, ENC1, DEC1)
+        epoch_loss_temp.backward(retain_graph=True)
         enc1=ObtainListOfParameters(ENC1)
         dec1=ObtainListOfParameters(DEC1)
         ENC2=copy.deepcopy(enc)
@@ -237,28 +139,21 @@ def ObtainGradientofDataNew(Encoder, Decoder, TrainingData, epochs,batch_size ,A
         DEC2.zero_grad()
         UpdateModel(ENC2,(-0.5)*Epsilon,ListOfParam=w1)
         UpdateModel(DEC2,(-0.5)*Epsilon,ListOfParam=w2)
-        (grad,ENC2,DEC2, given2, predict2)=GetGradientUsingAutoGrad(ENC2, DEC2, TrainingData=TrainingData, batch_size=batch_size)
+        (given2, predict2, answer2)=GetGradient(given, predict, answer,ENC2, DEC2)
         ENC2.zero_grad()
         DEC2.zero_grad()
-        epoch_loss_temp = CalculateLoss(ENC2, DEC2, TrainingData, batch_size=batch_size)
-        #epoch_loss_temp.backward()
+        epoch_loss_temp = GetLoss(given, predict, answer,ENC2, DEC2)
+        epoch_loss_temp.backward(retain_graph=True)
         enc2=ObtainListOfParameters(ENC2)
         dec2=ObtainListOfParameters(DEC2)
-        for i in range(len(given1)):
-            giventemp[i] = (given1[i]-given2[i])/Epsilon
-            predicttemp[i] = (predict1[i]-predict2[i])/Epsilon
-           # givenbasket.append((given1[i]-given2[i])/Epsilon) #same as ddxp in sensei's code
-           # predictbasket.append((predict1[i]-predict2[i])/Epsilon) #same as ddxp in sensei's code
-        #print('-------------len of givenzeros---------------')
-        #print(len(givenzeros))
-        #print('--------------len of givenbasket---------------')
-        #print(len(giventemp))
-        for i in range(len(giventemp)):
-            givengrad[i] = givenzeros[i]-(Alpha*giventemp[i])
-            predictgrad[i] = predictzeros[i]-(Alpha*predicttemp[i])
-            #gradgiven.append((givenzeros[i]-(Alpha*givenbasket[i])))
-            #gradpredict.append((predictzeros[i]-(Alpha*predictbasket[i])))
-        
+
+        giventemp = (given1-given2)/Epsilon
+        predicttemp = (predict1-predict2)/Epsilon
+        answertemp = (answer1-answer2)/Epsilon
+        givengrad = givengrad-(Alpha*giventemp)
+        predictgrad = predictgrad-(Alpha*predicttemp)
+        answergrad = answergrad-(Alpha*answertemp)
+                
         for j in range(len(enc1)):
             w1_tmp=(enc1[j].grad - enc2[j].grad)/Epsilon
             w1[j].grad = w1[j].grad - Alpha*w1_tmp
@@ -266,59 +161,23 @@ def ObtainGradientofDataNew(Encoder, Decoder, TrainingData, epochs,batch_size ,A
         for j in range(len(dec1)):
             w2_tmp=(dec1[j].grad - dec2[j].grad)/Epsilon
             w2[j].grad = w2[j].grad - Alpha*w2_tmp
-        #print('---------------reach here---------------')
-    for i in range(len(givengrad)):
-        if torch.max(torch.abs(givengrad[i]))>max_grad:
-            givengrad[i] = givengrad[i]/torch.max(torch.abs(givengrad[i]))*max_grad
-            
-        if torch.max(torch.abs(predictgrad[i]))>max_grad:
-            predictgrad[i] = predictgrad[i]/torch.max(torch.abs(predictgrad[i]))*max_grad
-    #print('----------reach last line --------------')
-    print(len(givengrad))
-    print(givengrad[0])
-    print(predictgrad[0])
-    return (givengrad, predictgrad, epoch_loss)
-        
-    
-#-----------------------------------------------------------------------------------------------------------------
+    return (givengrad*Scale, predictgrad*Scale, answergrad*Scale, loss)
 
-class ErrorFunctionWithPredefinedLossAndGrad(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx,inputs):
-        ctx.save_for_backward((0,1,2))
-        loss=inputs[1]
-        return loss
-    
-    @staticmethod
-    def backward(ctx, indexes, gy):
-        x,y,z = ctx.saved_tensors
-        gy0 = torch.broadcast_to(gy[0],y.shape)
-        return gy0*z, None, None
-
-
-def error_with_predefined_loss_and_grad(data,loss,grad):
-	return ErrorFunctionWithPredefinedLossAndGrad().apply((data,loss,grad))
-    #return ErrorFunctionWithPredefinedLossAndGrad().apply((data,loss,grad))[0]
 
 #------------------------------------------------------------------------------------------------------------------
 class ErrorFunctionWithPredefinedLossAndGradNew(torch.autograd.Function):
     @staticmethod
-    def forward(ctx,inputs):
-        ctx.save_for_backward((0,1,2,3,4))
-        #ctx.save_for_backward(given,predict,epochloss,givengrad,predictgrad)
-        loss = inputs[2]
+    def forward(ctx,x1,x2,x3,x4,x5,x6,x7):
+        ctx.save_for_backward(x1,x2,x3,x4,x5,x6,x7)
+        loss = x4
         return loss
 
     @staticmethod
     def backward(ctx,grad_output):
-        given,predict,epochloss,givengrad,predictgrad = ctx.saved_tensors
+        given,predict,answer, epochloss,givengrad,predictgrad,answergrad = ctx.saved_tensors
+        return givengrad, predictgrad, answergrad, None, None, None, None
 
-        return givengrad, predictgrad, None, None, None
 
-def error_with_predefined_loss_and_grad_new(given,predict,epochloss,givengrad,predictgrad):
-    return ErrorFunctionWithPredefinedLossAndGradNew().apply((given,predict,epochloss,givengrad,predictgrad))
-
-    
 
 #------------------------------------------------------------------------------------------------------------------
 
@@ -327,8 +186,9 @@ def SearchList(li,key):
         if li[i]==key:
             return i
     return -1
+
 #-------------------------------------------------------------------------------------------------------------------
-class DirectPoisoningAttackerNew():
+class DirectPoisoningAttacker():
     def __init__(self, TargetModelEnc, TargetModelDec, list_of_attack_points):
         self.TargetModelEnc=TargetModelEnc
         self.TargetModelDec=TargetModelDec
@@ -345,7 +205,93 @@ class DirectPoisoningAttackerNew():
     
         return value 
 
-    def sliding_window(self,x3):
+    def sliding_window(self,x3):    
+        x4 = []
+        for i in range(x3.shape[0]-100):
+            x4.append(x3[i:conf.WINDOW_SIZE + i])
+        split_window = [
+                        (w[:conf.WINDOW_GIVEN],
+                        w[conf.WINDOW_GIVEN:conf.WINDOW_GIVEN + conf.WINDOW_PREDICT],
+                        w[-1]) for w in x4
+                    ]
+        l1=list()
+        l2=list()
+        l3=list()
+        for i in split_window:
+            l1.append(i[0])
+            l2.append(i[1])
+            l3.append(i[2])
+        
+        return torch.stack(l1).to(torch.device('cuda:0')),torch.stack(l2).to(torch.device('cuda:0')),torch.stack(l3).to(torch.device('cuda:0'))
+        
+    def Generate(self,x2, features_for_validation, epochs, batch_size, steps=50):
+        l = nn.Linear(1,x2.size)
+        x2 = torch.tensor(x2).float()
+        features_for_validation=torch.tensor(features_for_validation).float()
+        (givenVal,predictVal,answerVal) = self.sliding_window(features_for_validation)
+        opt=optim.Adam(l.parameters())
+        mask1=self.MaskForAttackPoints(x2.shape)
+        mask = torch.tensor(mask1)
+        for i in range(steps):
+            x3=x2+mask*l(torch.tensor(np.zeros((1,1)).astype(np.float32))).reshape(x2.shape)
+            (given,predict,answer) = self.sliding_window(x3)
+            (gradgiven, gradpredict, answergrad, loss) = ObtainGradientofData(given,predict,answer,givenVal,predictVal,answerVal,self.TargetModelEnc, self.TargetModelDec, epochs, weight=1, batch_size=batch_size)
+            error_func = ErrorFunctionWithPredefinedLossAndGradNew.apply
+            loss1 = error_func(given,predict,answer,loss.requires_grad_(),gradgiven, gradpredict,answergrad)
+            l.zero_grad()
+            loss1.backward()
+            opt.step()
+            print("Loss for generator="+str(loss1))
+        return x3
+
+class PoisoningAttacker():
+    def __init__(self,GenModelEnc, GenModelDec, TargetModelEnc, TargetModelDec, list_of_attack_points):
+        self.GenModelEnc=GenModelEnc
+        self.GenModelDec=GenModelDec
+        self.GenModelEnc_optimizer = optim.Adam(self.GenModelEnc.parameters())
+        self.GenModelDec_optimizer = optim.Adam(self.GenModelDec.parameters())
+        self.TargetModelEnc=TargetModelEnc
+        self.TargetModelDec=TargetModelDec
+        self.TargetModelEnc_optimizer = optim.Adam(self.TargetModelEnc.parameters())
+        self.TargetModelDec_optimizer = optim.Adam(self.TargetModelDec.parameters())
+        self.li=list_of_attack_points
+    
+    def MaskForAttackPoints(self, size):
+        a=np.zeros(size[1])
+        for i in self.li:
+            a[i]=1
+        return np.tile(a,(size[0],1)).astype(np.float32)
+    
+    def AddAttack(self, base, x):
+        l=list()
+        (a,b)=base.shape
+        for i in range(b):
+            if i in self.li:
+                l.append(x[:,SearchList(self.li,i)].reshape(a,1))
+            else:
+                l.append(base[:,i].reshape(a,1))
+        return torch.hstack(l)
+    
+    def sliding_window(self,x3):    
+        x4 = []
+        for i in range(x3.shape[0]-100):
+            x4.append(x3[i:conf.WINDOW_SIZE + i])
+        split_window = [
+                        (w[:conf.WINDOW_GIVEN],
+                        w[conf.WINDOW_GIVEN:conf.WINDOW_GIVEN + conf.WINDOW_PREDICT],
+                        w[-1]) for w in x4
+                    ]
+        l1=list()
+        l2=list()
+        l3=list()
+        for i in split_window:
+            l1.append(i[0])
+            l2.append(i[1])
+            l3.append(i[2])
+        
+        return torch.stack(l1).to(torch.device('cuda:0')),torch.stack(l2).to(torch.device('cuda:0')),torch.stack(l3).to(torch.device('cuda:0'))
+
+    def split_data(self,x3):
     
         x4 = []
         for i in range(x3.shape[0]-100):
@@ -359,83 +305,101 @@ class DirectPoisoningAttackerNew():
                     ]
         
         return split_window
-
-    def GenerateNew(self,x2, epochs, batch_size, steps=50):
-        #BATCH_SIZE = 4096
-        l = nn.Linear(1,x2.size)
-        x2 = torch.tensor(x2)
-        opt=optim.Adam(l.parameters())
-        mask1=self.MaskForAttackPoints(x2.shape)
-        mask = torch.tensor(mask1)
-        for i in range(steps):
-            #x3=self.ClippedRelu(x2+mask*self.ClippedRelu(l(torch.tensor(np.zeros((1,1)).astype(np.float32))),z=1.0).reshape(x2.shape)-1.0*0.5*torch.tensor(np.ones(x2.shape).astype(np.float32))*mask,z=1.0)
-            x3=self.ClippedRelu(x2+mask*self.ClippedRelu(l(torch.tensor(np.zeros((1,1)).astype(np.float32))),z=1.0).reshape(x2.shape)-1.0*0.5*torch.tensor(np.ones(x2.shape).astype(np.float32))*mask,z=1.0).float()
-            splitdata = self.sliding_window(x3)
-            TrainingData = PoisonedDataset(training_data=splitdata)
-            (gradgiven, gradpredict,loss) = ObtainGradientofDataNew(self.TargetModelEnc, self.TargetModelDec, TrainingData, epochs, batch_size)
-            for batch in DataLoader(TrainingData,batch_size=batch_size, shuffle=True):
-                given1 = batch['given'].to(torch.device('cuda:0'))
-                predict1 = batch['predict'].to(torch.device('cuda:0'))
-                loss1 = error_with_predefined_loss_and_grad_new(given1,predict1,loss,gradgiven,gradpredict)
-                #loss1 = poisoning_attack_module.error_with_predefined_loss_and_grad(given1, epoch_loss, gradgiven[i])
-                loss1 = Variable(loss1, requires_grad = True)
-                #l.cleargrads()
-                l.zero_grad()
-                loss1.backward()
-                #opt.update()
-                opt.step()
-                print(loss1.data)
+    
+    def GenModel(self,encoder, decoder, dataset,batch_size):
+        l1 = list()
+        for batch in DataLoader(dataset, batch_size=batch_size, shuffle=True):
+            given = batch['given'].to(torch.device('cuda:0'))
+            predict = batch['predict'].to(torch.device('cuda:0'))
+            encoder_outs, context = encoder(given)
+            guess = decoder(encoder_outs, context, predict)
+            #stack = torch.stack(guess).to(torch.device('cuda:0'))
+            #print(guess)
+            l1.append(guess)
+    
+        return l1
+    
+    def TrainGenModel(self, x2, features_for_validation, epochs=50, batchsize=400, InverseLossFunction=True, steps=50):
         
+        x2 = torch.tensor(x2).float()
+        data_split = self.split_data(x2)
+        dataset = PoisonedDataset(data_split)
+        a = x2.shape[0]-100
+        x2 = x2[0:a]
+        x2 = x2.to(torch.device('cuda:0'))
+        mask1 = self.MaskForAttackPoints(x2.shape)
+        mask = torch.tensor(mask1).to(torch.device('cuda:0'))
+       # print(x2.get_device())
+        
+        features_for_validation=torch.tensor(features_for_validation).float()
+        (givenVal,predictVal,answerVal) = self.sliding_window(features_for_validation)
+
+        #size=int(math.ceil(x2.shape[0]/batchsize))
+
+        for i in range(steps):
+            guess = self.GenModel(self.GenModelEnc, self.GenModelDec,dataset,batchsize)
+            guess = torch.cat(guess, dim=0)
+            x3 = x2 + (mask * guess)
+            (given,predict,answer) = self.sliding_window(x3)
+            (gradgiven, gradpredict, answergrad, loss) = ObtainGradientofData(given, predict, answer, givenVal, predictVal, answerVal, self.TargetModelEnc, self.TargetModelDec, epochs,weight=1, batch_size=batchsize)
+            error_func = ErrorFunctionWithPredefinedLossAndGradNew.apply
+            loss1 = error_func(given, predict, answer, loss.requires_grad_(), gradgiven, gradpredict, answergrad)
+            self.GenModelEnc_optimizer.zero_grad()
+            self.GenModelDec_optimizer.zero_grad()
+            loss1.backward()
+            self.GenModelEnc_optimizer.step()
+            self.GenModelDec_optimizer.step()
+            print("Loss for generator = " + str(loss1))
         return x3
 
-#-------------------------------------------------------------------------------------------------------------------
-class DirectPoisoningAttacker():
-	def __init__(self, TargetModel,list_of_attack_points):
-		self.TargetModel=TargetModel
-		self.li=list_of_attack_points
+    def TrainGenModelWithHackedFeatures(self, x2, features_for_validation, epochs=50, batchsize=400, weight=0.5, InverseLossFunction=True, steps=50):
+        
+        x2 = torch.tensor(x2).float()
+        features_for_validation=torch.tensor(features_for_validation).float()
+        
+        #a = x2.shape[0]-100
+        #x2 = x2[0:a]
+        #x2 = x2.to(torch.device('cuda:0'))
+        mask1 = self.MaskForAttackPoints(x2.shape)
+        mask = torch.tensor(mask1)
+        #mask2 = self.MaskForAttackPoints(features_for_validation.shape)
+        #maskVal = torch.tensor(mask2)
+        x2 = x2 * mask
+        x2 = x2.to(torch.device('cuda:0'))
+        #print(x2[:5])
+        #features_for_validation = features_for_validation * maskVal
+        #features_for_validation = features_for_validation.to(torch.device('cuda:0'))
+        data_split = self.split_data(x2)
+        dataset = PoisonedDataset(data_split)
 
-	def ExtractAttackPoints(self, xs):
-		l=list()
-		(a,b)=xs.shape
-		for i in range(len(self.li)):
-			l.append(xs[:,self.li[i]].reshape(a,1))
-		return torch.hstack(l)
-	
-	def MaskForAttackPoints(self,size):
-		a=np.zeros(size[1])
-		for i in self.li:
-			a[i]=1
-		return np.tile(a,(size[0],1)).astype(np.float32)
-			
-	def Generate(self,Xp,Xval,Yp,Yval,alpha=0.01,step=50,max_pertubation=1.0,normalizeRequired=True,InverseLossFunction=True):
-		if normalizeRequired:
-			x2=torch.tensor(self.TargetModel.normalize(Xp))
 
-			xval2=torch.tensor(self.TargetModel.normalize(Xval))
-		else:
-			x2=Xp
-			xval2=Xval
-#		x2=F.clipped_relu(x2+(np.random.rand(x2.shape[0],x2.shape[1])-0.5)*2*self.MaskForAttackPoints(x2.shape),z=1.0)
-		l=nn.Linear(1,x2.size)
-		opt=optim.Adam(l.parameters())
-		#opt.setup(l)
-		mask=self.MaskForAttackPoints(x2.shape)
-		l.b.data=np.random.rand(x2.size).astype(np.float32)*0.5
-#		l.b.data=np.zeros(x2.size).astype(np.float32)*0.5
-		for i in range(step):
-			x3=torch.clamp(x2+mask*torch.clamp(l(torch.tensor(np.zeros((1,1)).astype(np.float32))),z=max_pertubation).reshape(x2.shape)-max_pertubation*0.5*np.ones(x2.shape).astype(np.float32)*mask,z=1.0)
-			(d,loss)=ObtainGradientOfData(self.TargetModel,x3,xval2,Yp,Yval,Mask=mask,InverseLossFunction=InverseLossFunction)
-			loss1=error_with_predefined_loss_and_grad(x3,loss,d)
-			l.cleargrads()
-			loss1.backward()
-			opt.update()
-			print(loss1.data)
-		if (normalizeRequired):
-			x3=self.TargetModel.denormalize(x3)
-		return x3
-    #-----------------------------------------------------------------------------------------------------------
-    
+       # print(x2.get_device())
+        
+        
+        (givenVal,predictVal,answerVal) = self.sliding_window(features_for_validation)
 
-def ListOfTargetPoint(TargetModel, target):
-	out=list(np.argsort(-np.mean(np.abs(TargetModel.test_each(target)),axis=0)))
-	return out
+        #size=int(math.ceil(x2.shape[0]/batchsize))
+        a = x2.shape[0]-100
+        x2 = x2[0:a]
+        #x2 = x2.to(torch.device('cuda:0'))
+        mask3 = self.MaskForAttackPoints(x2.shape)
+        mask4 = torch.tensor(mask3).to(torch.device('cuda:0'))
+
+        for i in range(steps):
+            guess = self.GenModel(self.GenModelEnc, self.GenModelDec,dataset,batchsize)
+            guess = torch.cat(guess, dim=0)
+            #print(guess[:5])
+            x3 = x2 + (mask4 * guess)
+            #print(x3[:5])
+            (given,predict,answer) = self.sliding_window(x3)
+            (gradgiven, gradpredict, answergrad, loss) = ObtainGradientofData(given, predict, answer, givenVal, predictVal, answerVal, self.TargetModelEnc, self.TargetModelDec, epochs, batch_size=batchsize)
+            error_func = ErrorFunctionWithPredefinedLossAndGradNew.apply
+            loss1 = error_func(given, predict, answer, loss.requires_grad_(), gradgiven, gradpredict, answergrad)
+            self.GenModelEnc_optimizer.zero_grad()
+            self.GenModelDec_optimizer.zero_grad()
+            loss=weight*loss1+(1-weight)*GetLoss(given, predict, answer, self.TargetModelEnc, self.TargetModelDec)
+            loss.backward()
+            self.GenModelEnc_optimizer.step()
+            self.GenModelDec_optimizer.step()
+            print("Loss for generator = " + str(loss1))
+        return x3        

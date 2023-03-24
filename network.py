@@ -1,10 +1,11 @@
 import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
-
+import pickle
 import conf
 import model
 from db import InfluxDB, swat_time_to_nanosec
+import matplotlib.pyplot as plt
 
 DB = InfluxDB('swat')
 
@@ -18,8 +19,16 @@ class Network():
 
         self.encoder = model.Encoder(n_inputs=n_features, n_hiddens=n_hiddens).to(self.gpu)
         self.decoder = model.AttentionDecoder(n_hiddens=n_hiddens, n_features=n_features).to(self.gpu)
+        #------------------------------------------------------------------------------------------------------
+        #with open ('dat/encoder.dat', 'wb') as fh:
+        #    pickle.dump(self.encoder,fh)
+        
+        #with open ('dat/decoder.dat', 'wb') as fh:
+        #    pickle.dump(self.decoder, fh)
+        #-------------------------------------------------------------------------------------------------------
 
-        self.model_fn = 'checkpoints/SWaT-P{}'.format(pidx)
+        self.model_fn = 'checkpoints/SWaT-BeforeAttackP{}'.format(pidx)
+        self.model_fn1 = 'checkpoints/SWaT-AfterAttackP{}'.format(pidx)
 
         self.encoder_optimizer = optim.Adam(self.encoder.parameters(), amsgrad=True)
         self.decoder_optimizer = optim.Adam(self.decoder.parameters(), amsgrad=True)
@@ -54,6 +63,7 @@ class Network():
     def eval(self, dataset, batch_size, db_write: bool) -> float:
         epoch_loss = 0
         n_datapoints = 0
+        
         for batch in DataLoader(dataset, batch_size=batch_size, shuffle=False):
             ts = [swat_time_to_nanosec(t) for t in batch['ts']]
             attack = batch['attack']
@@ -68,6 +78,7 @@ class Network():
                 fields = {k: col_dist[:, i] for i, k in enumerate(conf.P_SRCS[self.pidx - 1])}
                 fields.update({'distance': distance.cpu().tolist()})
                 DB.write(conf.EVAL_MEASUREMENT.format(self.pidx), {'attack': attack}, fields, ts)
+        
         return epoch_loss / n_datapoints
 
     def infer(self, batch):
@@ -77,9 +88,20 @@ class Network():
         encoder_outs, context = self.encoder(given)
         guess = self.decoder(encoder_outs, context, predict)
         return answer, guess
+    
+    def load1(self) -> float:
+        #checkpoint = torch.load('checkpoints/modelPoison')
+        checkpoint = torch.load('dat/w0.01/modelPoison')
+        self.encoder.load_state_dict(checkpoint['model_encoder'])
+        self.decoder.load_state_dict(checkpoint['model_decoder'])
+        return checkpoint['min_loss']
 
-    def load(self, idx: int) -> float:
-        fn = self.model_fn + '-{}.net'.format(idx)
+    def load(self, idx: int, beforeAttack = True) -> float:
+        if beforeAttack == True:
+            fn = self.model_fn + '-{}.net'.format(idx)
+        else:
+            fn = self.model_fn1 + '-{}.net'.format(idx)
+            
         checkpoint = torch.load(fn)
         self.encoder.load_state_dict(checkpoint['model_encoder'])
         self.decoder.load_state_dict(checkpoint['model_decoder'])
@@ -87,8 +109,12 @@ class Network():
         self.decoder_optimizer.load_state_dict(checkpoint['optimizer_decoder'])
         return checkpoint['min_loss']
 
-    def save(self, idx: int, min_loss: float) -> None:
-        fn = self.model_fn + '-{}.net'.format(idx)
+    def save(self, idx: int, min_loss: float, beforeAttack = True) -> None:
+        if beforeAttack == True:
+            fn = self.model_fn + '-{}.net'.format(idx)
+        else:
+            fn = self.model_fn1 + '-{}.net'.format(idx)
+
         torch.save(
             {
                 'min_loss': min_loss,

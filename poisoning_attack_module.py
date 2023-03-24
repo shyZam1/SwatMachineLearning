@@ -13,6 +13,10 @@ from torch.autograd import Variable
 from torch import nn, optim
 from torch.utils.data import DataLoader
 from network import Network
+from datetime import datetime
+from db import InfluxDB, datetime_to_nanosec
+import pickle
+from sklearn.preprocessing import MinMaxScaler
 
 def GetLoss(given, predict, answer, enc, dec, InverseLossFunction=False):
     encoder_outs, context = enc(given)
@@ -81,6 +85,15 @@ def UpdateModel(Model, Alpha,ListOfParam=None):
 			w.data=w.data +Alpha * ListOfParam[i].grad
 			i=i+1
 
+def save(min_loss:float, enc, dec) -> None:
+    torch.save(
+        {
+            'min_loss': min_loss,
+            'model_encoder': enc.state_dict(),
+            'model_decoder': dec.state_dict(),
+        },
+        'checkpoints/modelPoison'
+    )
 def TrainTargetModel(given, predict, answer, ModelEnc, ModelDec, epochs,  Alpha=0.1):
     enc = copy.deepcopy(ModelEnc)
     dec = copy.deepcopy(ModelDec)
@@ -89,6 +102,7 @@ def TrainTargetModel(given, predict, answer, ModelEnc, ModelDec, epochs,  Alpha=
         epoch_loss.backward(retain_graph=True)
         UpdateModel(enc,-Alpha)
         UpdateModel(dec,-Alpha)
+        save(epoch_loss, enc, dec)
         #print("Train Target Model New epoch loss ="+ str(epoch_loss))
     return (epoch_loss,enc,dec)
 
@@ -306,15 +320,24 @@ class PoisoningAttacker():
         
         return split_window
     
+    def selu(self, x):
+        alpha = 0.9
+        scale = 0.5
+        return scale * torch.where(x > 0, x, alpha * (torch.exp(x) - 1))
+
     def GenModel(self,encoder, decoder, dataset,batch_size):
         l1 = list()
+        #with open("dat/min_max_scaler.pickle", "rb") as f:
+        #    scaler = pickle.load(f)
+
         for batch in DataLoader(dataset, batch_size=batch_size, shuffle=True):
             given = batch['given'].to(torch.device('cuda:0'))
             predict = batch['predict'].to(torch.device('cuda:0'))
             encoder_outs, context = encoder(given)
             guess = decoder(encoder_outs, context, predict)
-            #stack = torch.stack(guess).to(torch.device('cuda:0'))
-            #print(guess)
+        #    guess = self.selu(guess)
+        #    guess_denormalized = scaler.inverse_transform(guess.cpu().detach().numpy())
+        #    guess = torch.tensor(guess_denormalized).to(torch.device('cuda:0'))
             l1.append(guess)
     
         return l1
@@ -353,8 +376,17 @@ class PoisoningAttacker():
         return x3
 
     def TrainGenModelWithHackedFeatures(self, x2, features_for_validation, epochs=50, batchsize=400, weight=0.5, InverseLossFunction=True, steps=50):
-        
+        print('Number of Epoch'+ str(epochs))
+        print('Weight = ' + str(weight))
         x2 = torch.tensor(x2).float()
+        #I will make a copy of x2 and name it as x2_orignal 
+        x2_original = x2
+        #with open('dat/min_max_scaler.pickle', 'rb') as f:
+        #    scaler = pickle.load(f)
+        #x2_original_denormalized = scaler.inverse_transform(x2_original)
+        #x2_original_denormalized = torch.tensor(x2_original_denormalized).float()
+        x2_original = x2_original.to(torch.device('cuda:0'))
+        
         features_for_validation=torch.tensor(features_for_validation).float()
         
         #a = x2.shape[0]-100
@@ -372,15 +404,18 @@ class PoisoningAttacker():
         data_split = self.split_data(x2)
         dataset = PoisonedDataset(data_split)
 
-
-       # print(x2.get_device())
-        
+        DB = InfluxDB('swat')
+        influx_measurement = 'generator_train_loss'
+        DB.clear(influx_measurement)
         
         (givenVal,predictVal,answerVal) = self.sliding_window(features_for_validation)
 
         #size=int(math.ceil(x2.shape[0]/batchsize))
         a = x2.shape[0]-100
         x2 = x2[0:a]
+        #do the same as above for x2_original
+        b = x2_original.shape[0]-100
+        x2_original = x2_original[0:b]
         #x2 = x2.to(torch.device('cuda:0'))
         mask3 = self.MaskForAttackPoints(x2.shape)
         mask4 = torch.tensor(mask3).to(torch.device('cuda:0'))
@@ -388,8 +423,13 @@ class PoisoningAttacker():
         for i in range(steps):
             guess = self.GenModel(self.GenModelEnc, self.GenModelDec,dataset,batchsize)
             guess = torch.cat(guess, dim=0)
-            #print(guess[:5])
-            x3 = x2 + (mask4 * guess)
+            #guess = np.concatenate(guess,axis=0)
+            #guess = torch.tensor(guess).to(torch.device('cuda:0'))
+            print("value of guess")
+            print(guess[:5])
+            print(guess.shape)
+            #x3 = x2 + (mask4 * guess) instead of using x2 which already has a mask and whole input becomes 0 apart from hacked sensor whose values becomes 1
+            x3 = x2_original + (mask4 * guess)
             #print(x3[:5])
             (given,predict,answer) = self.sliding_window(x3)
             (gradgiven, gradpredict, answergrad, loss) = ObtainGradientofData(given, predict, answer, givenVal, predictVal, answerVal, self.TargetModelEnc, self.TargetModelDec, epochs, batch_size=batchsize)
@@ -397,9 +437,18 @@ class PoisoningAttacker():
             loss1 = error_func(given, predict, answer, loss.requires_grad_(), gradgiven, gradpredict, answergrad)
             self.GenModelEnc_optimizer.zero_grad()
             self.GenModelDec_optimizer.zero_grad()
-            loss=weight*loss1+(1-weight)*GetLoss(given, predict, answer, self.TargetModelEnc, self.TargetModelDec)
+            targetloss = GetLoss(given, predict, answer, self.TargetModelEnc, self.TargetModelDec)
+            loss=weight*loss1+(1-weight)*targetloss
             loss.backward()
             self.GenModelEnc_optimizer.step()
             self.GenModelDec_optimizer.step()
-            print("Loss for generator = " + str(loss1))
+            DB.write(
+                influx_measurement,
+                {},
+                {'generator_loss': [loss]},
+                [datetime_to_nanosec(datetime.now())]
+            )
+            print("Loss for generator after weighted loss = " + str(loss))
+            print("Loss for generator without weighted loss = " + str(loss1))
+            print("Loss for Targetmodel  = " + str(targetloss))
         return x3        

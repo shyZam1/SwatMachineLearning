@@ -9,8 +9,8 @@ import conf
 from db import InfluxDB, datetime_to_nanosec
 
 DB = InfluxDB('swat')
-FETCH_SIZE = 1_000
-#FETCH_SIZE = 901
+#FETCH_SIZE = 1_000
+FETCH_SIZE = 500
 
 
 class Smooth:
@@ -87,7 +87,9 @@ def main():
     low_percentile = int(judge_conf['LowPercentile'])
     alert_ratio = int(judge_conf['AlertRatio'])
 
-    start = datetime(2015, 12, 28, 10, 1, 30)
+    start = datetime(2015, 12, 28, 9, 3, 9)# use this to check if the attack gets detected by looking at the anormaly score. 
+    #start = datetime(2015, 12, 28, 10, 1, 30)
+    #start = datetime(2015, 12, 23, 10, 1, 30)
     pidx = args.process
     assert 1 <= pidx <= 6
 
